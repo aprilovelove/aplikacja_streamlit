@@ -18,17 +18,17 @@ from database import SessionLocal, SavedRoute, User
 # --- KONFIGURACJA I SŁOWNIKI ---
 
 BIKE_PROFILES = {
-    "Szosowy": {
+    "Szosowy/miejski": {
         "good": ["asphalt", "concrete", "paved"],
         "neutral": ["sett", "unpaved"],
         "bad": ["gravel", "cobblestone", "dirt", "sand", "grass", "ground"]
     },
-    "Gravel": {
+    "Gravel(hybrydowy)": {
         "good": ["asphalt", "gravel", "unpaved", "dirt", "compacted"],
         "neutral": ["concrete", "sett", "cobblestone"],
         "bad": ["sand", "grass"]
     },
-    "MTB": {
+    "MTB(terenowy)": {
         "good": ["gravel", "dirt", "sand", "grass", "ground", "cobblestone", "unpaved"],
         "neutral": ["asphalt", "concrete", "sett"],
         "bad": []
@@ -165,28 +165,33 @@ if 'generated_geojson' not in st.session_state: st.session_state.generated_geojs
 if 'map_center' not in st.session_state: st.session_state.map_center = [50.2859, 18.9549]
 if 'load_info' not in st.session_state: st.session_state.load_info = None
 if 'route_score' not in st.session_state: st.session_state.route_score = (None, None)
+if 'loc_requested' not in st.session_state: st.session_state.loc_requested = False
 
 # --- MECHANIZM AKTUALIZACJI WSPÓŁRZĘDNYCH ---
-# Jeśli w sesji jest flaga 'new_coords', nadpisujemy wartości widgetów przed ich wyrenderowaniem
 if 'new_coords' in st.session_state:
     st.session_state.lat_widget = st.session_state.new_coords[0]
     st.session_state.lon_widget = st.session_state.new_coords[1]
     st.session_state.map_center = st.session_state.new_coords
     del st.session_state.new_coords
 
-# Domyślne wartości dla widgetów (jeśli nie istnieją)
 if 'lat_widget' not in st.session_state: st.session_state.lat_widget = st.session_state.map_center[0]
 if 'lon_widget' not in st.session_state: st.session_state.lon_widget = st.session_state.map_center[1]
 
+# --- OBSŁUGA GPS W TLE ---
+# Wywołujemy to ZAWSZE, jeśli użytkownik kliknął przycisk, aby JS mógł zwrócić wynik w następnym cyklu
+if st.session_state.loc_requested:
+    loc_data = get_geolocation()
+    if loc_data:
+        st.session_state.new_coords = [loc_data['coords']['latitude'], loc_data['coords']['longitude']]
+        st.session_state.loc_requested = False
+        st.rerun()
 
 def load_route_action(geojson_data, name):
     data = json.loads(geojson_data)
     st.session_state.generated_geojson = data
     st.session_state.load_info = name
     first_coord = data['features'][0]['geometry']['coordinates'][0]
-    # Ustawiamy "poczekalnię" dla współrzędnych
     st.session_state.new_coords = [first_coord[1], first_coord[0]]
-    # st.rerun() zostanie wywołane bezpośrednio po tej funkcji w przycisku
 
 
 def update_center():
@@ -223,17 +228,14 @@ with st.sidebar:
     st.divider()
     st.header("🪧 Parametry Trasy")
     if st.button("Użyj mojej lokalizacji"):
-        loc = get_geolocation()
-        if loc:
-            st.session_state.new_coords = [loc['coords']['latitude'], loc['coords']['longitude']]
-            st.rerun()
+        st.session_state.loc_requested = True
+        st.rerun()
 
-    # Widgety powiązane z session_state za pomocą 'key'
     st.number_input("Szerokość (Lat)", format="%.6f", key="lat_widget", on_change=update_center)
     st.number_input("Długość (Lon)", format="%.6f", key="lon_widget", on_change=update_center)
 
     dist_km = st.slider("Dystans (km)", 5, 100, 20)
-    bike_type = st.selectbox("Typ roweru", ["Brak", "Szosowy", "Gravel", "MTB"])
+    bike_type = st.selectbox("Typ roweru(opcjonalne)", ["Brak", "Szosowy/miejski", "Gravel(hybrydowy)", "MTB(terenowy)"])
     clean_option = st.checkbox("Wyczyść backtracking", value=True)
     generate_btn = st.button("🚴‍♂️ Wygeneruj Trasę", type="primary")
 
@@ -251,7 +253,6 @@ with tab1:
     if generate_btn:
         with st.spinner("Trwa przygotowywanie trasy..."):
             try:
-                # Pobieramy aktualne wartości bezpośrednio z widgetów w sesji
                 curr_lat = st.session_state.lat_widget
                 curr_lon = st.session_state.lon_widget
 
@@ -285,7 +286,6 @@ with tab1:
             except Exception as e:
                 st.error(f"Błąd: {e}")
 
-    # RENDERING MAPY I WYNIKÓW
     if st.session_state.generated_geojson:
         data = st.session_state.generated_geojson
         dist = data['features'][0]['properties']['length_km']
@@ -343,13 +343,18 @@ with tab1:
 
 # --- POZOSTAŁE ZAKŁADKI ---
 with tab2:
-    st.header("🌍 Społeczność")
+    st.header("🌍 Trasy dodane przez społeczność")
     db = SessionLocal()
     routes = db.query(SavedRoute).filter_by(visibility='public').all()
     for r in routes:
         with st.container(border=True):
             c1, c2 = st.columns([3, 1])
-            c1.write(f"**{r.name}** | Autor: {r.owner.username}")
+            try:
+                r_data = json.loads(r.geojson_data)
+                r_dist = r_data['features'][0]['properties'].get('length_km', '??')
+            except:
+                r_dist = "??"
+            c1.write(f"**{r.name}** ({r_dist} km) | Autor: {r.owner.username}")
             if c2.button("↗️ Wczytaj", key=f"pub_{r.id}"):
                 load_route_action(r.geojson_data, r.name)
                 st.rerun()
@@ -363,7 +368,12 @@ with tab3:
         for r in my_routes:
             with st.container(border=True):
                 c1, c2, c3 = st.columns([2, 1, 1])
-                c1.write(f"**{r.name}** ({r.visibility})")
+                try:
+                    r_data = json.loads(r.geojson_data)
+                    r_dist = r_data['features'][0]['properties'].get('length_km', '??')
+                except:
+                    r_dist = "??"
+                c1.write(f"**{r.name}** ({r_dist} km) [{r.visibility}]")
                 if c2.button("↗️ Wczytaj", key=f"my_{r.id}"):
                     load_route_action(r.geojson_data, r.name)
                     st.rerun()
